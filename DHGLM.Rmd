@@ -1,0 +1,500 @@
+---
+title: "Fitting multi-way DHGLM in Stan"
+#author: "Jessica King, Joel Pick & Jarrod Hadfield"
+output: 
+  html_document:
+    toc: true
+    css: custom.css
+bibliography: /Users/jhadfiel/Work/Tex/library/JarLib.bib
+---
+
+
+<script src="hideOutput.js"></script>
+
+<script type="text/javascript">
+  // When the document is fully rendered...
+  $(document).ready(function() {
+    // ...select all header elements...
+    $('h1, h2, h3, h4, h5').each(function() {
+      // ...and add an id to them corresponding to their 'titles'
+      $(this).attr('id', $(this).html());
+    });
+  });
+</script>
+
+```{r}
+library(rstan)
+library(coda)
+library(MASS)
+library(tidyverse)
+```
+
+```{r global_options, include=FALSE}
+base_path<-"~/Work/VaVm"
+# rmarkdown::render(file.path(base_path, "R/DHGLM.Rmd")) # output_format="pdf_document")
+rstan_options("auto_write"=TRUE)
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+rerun_stan=FALSE
+rerun_sim_power=FALSE
+save_sim=FALSE
+```
+
+
+
+In this workbook we implement Stan code for fitting a simple multi-way DHGLM. The multi-way DHGLM can be envisaged as a series of standard linear mixed models applied to subsets (groups) of the data. For each group, a single set of random effects (subgroup effects) are fitted, leading to a subgroup variance and a residual variance. The linear mixed models are linked in two ways: group means (the intercepts of the standard linear mixed models) are treated as random over groups, and the pair of variances for each group (residual and subgroup) are assumed to be drawn from a bivariate log-normal distribution over groups, the parameters of which are estimated. We also provide a function for simulating data under this model assuming a balanced design, and then fit the model to data generated using this function. 
+
+
+# Stan code for fitting DHGLM
+
+The data structure consists of integers specifying the total number of observations `Nt`, the number of groups `Ng` and the number subgroups `c`, a real vector of observations `y`, and integer vectors `group` and `subgroup` specifying the group and subgroup identifier for each observation. The data do not need to be balanced (i.e. all subgroups present for all groups with equal replication) but the `group` and `subgroup` indices must be integers in the sequence `1:Ng` and `1:c` respectively. `muvar` is an integer indicating whether a mean-variance relationship over groups should be fitted (`1`) or not (`0`). The Mean Model is
+
+$$
+y_{ijk} = \mu + t_i + u_{ij} + e_{ijk},
+$$
+
+where $\mu$ is the global intercept (`beta`) and $t_i$ is the group $i$ effect (`egroup`), $u_{ij}$ is the subgroup $j$ effect in group $i$ (`egroup_by_subgroup`) and $e_{ijk}$ is a residual.  $t$ are normally distributed with zero mean and standard deviation $\sqrt{V_t}$ (`sgroup`). The $u_{i\bullet}$ and $e_{i\bullet\bullet}$ are normally distributed with zero mean and group specific standard deviations  $\sqrt{V_{u(i)}}$ (`sds[1,i]`)and $\sqrt{V_{e_{i}}}$ (`sds[2,i]`), respectively. 
+
+The Dispersion Model for the subgroup standard deviations is 
+
+$$
+log(\sqrt{V_{u(i)}}) = \mu_u + \beta_ut_i+d_{u(i)}
+$$
+
+where $\mu_u$ and $\beta_u$ specify the intercept and slope for the logged standard deviation $\log(\sqrt{V_{u(i)}})$ regressed on the group effect $t_i$ and $d_{u(i)}$ is the residual. An equivalent Dispersion Model is fitted for the residual standard deviations as
+
+$$
+log(\sqrt{V_{e(i)}}) = \mu_e + \beta_et_i + d_{e(i)}.
+$$
+
+When `muvar` is `0` then `beta_lsds`=$\left[\mu_u,\ \mu_e\right]^{'}$ and the slopes are set to zero. When `muvar` is `1` then `beta_lsds`=$\left[\mu_u,\ \mu_e, \beta_u, \beta_e\right]^{'}$. Alternative models for the mean-variance relationship might be considered. For example, rather than assuming the residual standard deviations are constant across sub-groups within a group, the residual standard deviations could be regressed on the sub-group locations $t_i+u_{ij}$ rather than those of the group $t_i$. Additionally, in many cases it might be more suitable to fit the log group means ($log(\mu+t_i)$) as a covariate allowing  the variances to follow a power law [@Wagner.2023] of the form (for the residual standard deviation): 
+
+$$\sqrt{V_{e(i)}} = exp(\mu_e+d_{e(i)})(\mu+t_i)^{\beta_e}$$
+
+
+$d_{u(i)}$ and $d_{e(i)}$ are assumed to follow a bivariate normal distribution with zero mean and covariance matrix parameterised in terms of a correlation `r_lsds` and a vector of standard deviations `sigma_lsds`.  Note that when mean-variance relationships are modelled, `r_lsds` measures the log scale correlation in variance components after controlling for any mean-variance relationship. Calculating the unconditional log-scale correlation under a log-linear mean-variance relationship would be straightforward: $\beta_e\beta_uV_t$ would have to be added to the covariance, and $\beta_e^2V_t$ and $\beta_u^2V_t$ added to the variances, respectively, before recalculating the correlation. However, calculating the unconditional log-scale correlation under a power-law relationship would be more difficult since $V_t$ in the above expressions would have to be replaced by $Var(log(\mu+t))$ which could only be approximated: using the Delta method, $Var(log(\mu+t))\approx V_t/\mu^2$). 
+
+As with the Mean Model, additional random effects for the Dispersion model may be considered. For example, sub-groups within groups might have heterogeneous variances even after controlling for any mean-variance relationship. Then, a model of the from:
+
+$$
+log(\sqrt{V_{e(ij)}}) = \mu_e + \beta_e(t_i+u_{ij}) + d_{e(i)}+d_{e(ij)}.
+$$
+
+where the $d_{e(ij)}$ are treated as random variables might be more suitable. Similarly, there might be heterogeneous variances at the level of the observation, which following the previous logic suggests the model:
+
+
+$$
+log(\sqrt{V_{e(ijk)}}) = \mu_e + \beta_e(t_i+u_{ij}) + d_{e(i)}+d_{e(ij)}+d_{e(ijk)}.
+$$
+
+Since there is only one observation per level of the observation-level random effect, $d_{e(ijk)}$, the identifiability of these parameters, and their variance, might be called into question. However, the effects are weakly identifiable since their presence will cause the distribution of residuals within a group (or sub-group if $d_{e(ij)}$ is fitted) to have excess kurtosis with respect to the normal. Since the scaled t-distribution can be viewed as a compound distribution of normals whose variances are drawn from an inverse gamma distribution, a model that assumes the $e_{ijk}$ are from a scaled-t, rather than a normal, is equivalent to fitting $d_{e(ijk)}$ as a random effect in the Dispersion Model but assuming they follow an inverse-gamma distribution rather than a log-normal. While the t-distribution approach may be considered less satisfying in that the random effects in the Dispersion Model are effectively following different distributions, a log-normal and inverse-gamma that are matched for their mean and variance are often very similar. The advantage of the t-distribution approach is that the $d_{e(ijk)}$ are effectively integrated out analytically leaving only a single parameter to be estimated (the degrees of freedom) where as the $d_{e(ijk)}$ under the log-normal approach need to be integrated out using MCMC which may be computationally prohibitive. Options for using the t-distribution approach are commented out in the code below (see @Juarez.2010 for a discussion of prior specifications for the degrees of freedom). 
+
+
+Note that the parameterisations above are for the log standard deviations rather than the log variances given in the main manuscript, hence the slightly different notation.  However, on the log-scale, reparameterising from the variances to the standard deviations simply scales location and standard deviation effects by two and variances by four. Hence to obtain parameters under the log-variance parameterisation we can multiply `beta_lsds` and `sigma_lsds` by two to get the fixed effects and standard deviations under a log-variance parameterisation. The correlation `r_lsds` is equivalent for both parameterisations. In addition, the mean-variance slopes ($\beta_u$ and $\beta_e$) in the manuscript were omitted and effectively set to zero. 
+
+
+External priors are required for the \`fixed effects\`, `beta` and `beta_lsds`, and the dispersion parameters `sgroup`, `r_lsds` and `sigma_lsds`. Elements of `beta` and `beta_lsds` are assigned normal priors with zero mean and standard deviations of 10, and `sgroup` a half-Cauchy prior with location $0$ and scale $5$.  `r_lsds` is assigned a uniform prior from -1 to 1 (although parameterised through a Lewandowski-Kurowicka-Joe (LKJ) prior).  `GIG_lpdf` is a function (provided by Enrico Fabrizi) for calculating the log-density of the Generalised Inverse Gaussian (GIG) distribution, although only integer values of $\gamma$ are permitted. `sqrtGIG_lpdf` is a function for calculating the density of a standard deviation had the variance come from a GIG distribution. The elements of `sigma_lsds` squared (i.e. the variances) are assigned a GIG prior with $\lambda=1$ , $\delta=0.01$ and $\gamma=\sqrt{3+9/N_g}$ (see @Gardini.2021 for notation and details). However, commented out code provides the option for using half-Cauchy priors on `sigma_lsds` instead. The following stan code object is named `DHGLM_stan`.
+
+```{stan, output.var="DHGLM_stan"}
+functions{
+
+  // GIG prior: Enrico Fabrizi https://link.springer.com/article/10.1007/s11336-021-09769-y
+  //            only integer lambda allowed 
+
+  real GIG_lpdf(real y, int lambda, real delta, real gamma){
+    real log_p;
+    log_p=1.0*lambda*log(gamma/delta)-log(2.0)-log(modified_bessel_second_kind(lambda, delta*gamma))
+    +(1.0*lambda-1.0)*log(y)-0.5*(delta*delta/y+gamma*gamma*y);
+    return(log_p);
+  }
+
+  // GIG_lpdf calculates the log density of y given a GIG distribution. 
+  // If y are variances, but we are working on the standard deviation scale, sqrt_y, 
+  // we can calculate the same density as J*GIG(sqrt_y^2) where J is the Jacobian
+  // (the partial derivative of y with respect to sqrt_y (i.e 2 * sqrt_y)).
+  
+  real sqrtGIG_lpdf(real sqrt_y, int lambda, real delta, real gamma){
+    real log_p;
+    log_p = log(sqrt_y)+log(2.0);  // Jacobian
+    log_p += 1.0*lambda*log(gamma/delta)-log(2.0)-log(modified_bessel_second_kind(lambda, delta*gamma))
+    +(1.0*lambda-1.0)*log(sqrt_y^2)-0.5*(delta*delta/sqrt_y^2+gamma*gamma*sqrt_y^2);
+    return(log_p);
+  }
+
+}
+
+data{
+  int<lower=0> Nt;    // total number of observations (Ng*Nt*c if balanced)
+  int<lower=0> Ng;    // number of groups
+  int<lower=0> c;     // number of subgroups
+  real y[Nt];         // observations
+  int group[Nt];      // group identifier
+  int subgroup[Nt];   // subgroup identifier
+  int muvar;          // should the relationship between the mean and variance be modelled
+}
+
+parameters{
+
+  // MEAN MODEL
+  
+  real beta;                            // intercept for the mean model
+  
+  // standard-deviation standardised random effects for mean part of the model: 
+
+  matrix[c,Ng] egroup_by_subgroup_star; // matrix of subgroup random effects within groups 
+  row_vector[Ng] egroup_star;           // vector of group random effects
+
+  real<lower=0> sgroup;                 // standard-deviations of the group effects
+  
+  // VARIANCE MODEL (parameterised in terms of log-standard deviations)
+
+  row_vector[2+2*muvar] beta_lsds; // fixed effects for the variance part of the model
+                                   // [1] subgroup log-standard-deviation intercept 
+                                   // [2] residual log-standard-deviation intercept 
+                                   // if muvar==1
+                                   // [3] slope of subgroup log-standard-deviation on mean
+                                   // [4] slope of residual log-standard-deviation on mean
+
+  // standard-deviation standardised random effects for variance part of the model: 
+
+  matrix[2,Ng] lsds_star;  // matrix of group-specific random effects for the log standard-deviations 
+                           // Rows are subgroup (Vu) and residual (Ve) 
+
+  vector<lower=0>[2] sigma_lsds;  // standard deviations of the group-specific log standard-deviations
+
+  cholesky_factor_corr[2] Lr_lsds; // Cholesky factor of the correlation matrix
+                                   // of group-specific log standard-deviations
+ 
+}
+
+transformed parameters{
+
+ // MEAN MODEL
+
+  vector[Nt] mu;   // linear predictor for mean part of the model
+
+ // unstandardised random effects for mean part of the model: 
+
+  row_vector[Ng] egroup;
+
+  matrix[c,Ng] egroup_by_subgroup;
+  
+// VARIANCE MODEL
+
+  vector<lower=0>[Nt] SD;   // residual standard deviation for each observation
+
+// unstandardised random effects for the variance part of the model: 
+
+  matrix[2,Ng] sds; 
+
+  egroup = egroup_star*sgroup;
+
+  sds = diag_pre_multiply(sigma_lsds, Lr_lsds)*lsds_star; 
+  
+  sds[1,] += beta_lsds[1];
+  sds[2,] += beta_lsds[2];
+
+  // adding the intercept to the log-standard-deviations
+  
+  if(muvar==1){
+    sds[1,] += beta_lsds[3]*egroup;
+    sds[2,] += beta_lsds[4]*egroup;
+  }
+  // adding a slope (mean-variance relationship) to the log-standard-deviations
+
+  sds = exp(sds);
+  // exponentiate log-standard-deviations to get standard-deviations
+  
+  // unstandardised random effects in Mean Model whose variance varies over groups: 
+
+  for(i in 1:c){
+    egroup_by_subgroup[i,] = sds[1,].*egroup_by_subgroup_star[i,];
+  }
+  
+  for(i in 1:Nt){   
+    mu[i] = beta + egroup[group[i]] + egroup_by_subgroup[subgroup[i], group[i]];
+    SD[i] = sds[2,group[i]];
+  }
+  // mean and random parts of the model
+                            
+}
+model{
+ 
+  // MEAN MODEL
+
+  beta ~ normal(0, 10);            // prior distributions for the fixed effects for the mean model
+  
+  egroup_star ~ std_normal(); 
+  to_vector(egroup_by_subgroup_star) ~ std_normal();
+  to_vector(lsds_star) ~ std_normal();
+  // unit-normal prior distributions for the standardised random effects 
+
+  sgroup ~ cauchy(0, 5);
+  // prior distributions for the standard-deviations of the group effects 
+
+  // VARIANCE MODEL
+
+  beta_lsds ~ normal(0, 10);      // prior for the fixed effects for the variance model
+  
+  // priors for the variance of the subgroup/residual log standard-deviations 
+  sigma_lsds[1]  ~ sqrtGIG(1,0.01,sqrt(3.0+9.0/Ng)); 
+  sigma_lsds[2]  ~ sqrtGIG(1,0.01,sqrt(3.0+9.0/Ng)); 
+
+  // sigma_lsds ~ cauchy(0, 5);  // replaces the GIG prior if half-Cauchy used
+
+  Lr_lsds ~ lkj_corr_cholesky(1); // prior for the correlation matrix
+                                  // of group-specific log standard-deviations.
+  
+  y ~ normal(mu, SD);
+
+  // nu ~ gamma(2,0.1); 
+  // y ~ student_t(nu, mu, SD)  
+  // An alternative model to y ~ normal(mu, SD) that deals with observation-level heterogeneity.
+  // The residuals are assumed to be t-distributed rather than normal.
+}
+
+generated quantities{
+  matrix [2,2] r_lsds = multiply_lower_tri_self_transpose(Lr_lsds);
+  // returning correlation matrices in the model output from the Cholesky factors  
+}
+```
+
+# Function for simulating observations from a DHGLM
+
+A function is implemented for simulating data under the DHGLM described above assuming a balanced design. `n` observations are simulated for each of `c` subgroups for each of `Ng` groups. `beta` specifies the overall intercept (mean in this case) of the observations and `sgroup` the standard deviation of the group effects (the Mean Model). `beta_lsds` can be of length two, in which case it specifies the intercept (mean in this case) of the log standard deviations of subgroup effects followed by residual effects.  If `beta_lsds` is of length four, then the third and fourth elements specify the slope of the log standard deviations (subgroup and residual respectively) on the group effects from the Mean Model. `C_lsds` is the 2x2 covariance matrix for the two log standard deviations, with subgroup in row/column one, and residual in row/column two. `beta_lsds` and `C_lsds` define the Dispersion Model.
+
+```{r}
+sim_DHGLM<-function(Ng, c, n, beta, sgroup, beta_lsds,  C_lsds){
+  
+  #######################################################
+  # Function for simulating data from a multi-way DHGLM #
+  #######################################################
+
+  # Data Structure
+
+  # Ng:        number of groups
+  # c:         number of subgroups
+  # n:         number of observations within subgroups
+
+  # Mean Model
+
+  # beta:      intercept of the Mean Model
+  # sgroup:    standard deviation of group effects
+
+  # Dispersion Model
+
+  # beta_lsds: fixed effects for log(sd) part of the model 
+  #            [intercepts followed by mean-log(sd) slopes]
+  # C_lsds:    covariance matrix of log(sd)'s
+  # in beta_lsds and C_lsds, Vu is followed by Ve  
+
+  ###########################################
+  # set up a data-frame for balanced design #
+  ###########################################
+
+  data <- as.data.frame(matrix(NA,Ng*c*n,3))
+  names(data) <- c("group","subgroup", "group_by_subgroup")
+
+  data$group <- rep(1:Ng,c*n)
+  data$subgroup <- rep(1:c, each = Ng * n)
+  data$group_by_subgroup <- match(paste(data$group,data$subgroup),  
+    c(t(outer(unique(data$group), unique(data$subgroup), paste))))
+  # gets group_by_subgroup indicies with subgroup varying the fastest
+  # (i.e. with groups 1,2 and subgroups a,b and c, 
+  # group_by_subgroup indicies 1-6 index 1-a, 1-b, 1-c, 2-a, 2-b,2-c)
+
+  if(!length(beta)==1){
+    stop("beta (intercept) should be of length 1")
+  }
+  # check whether beta has the right number of fixed effects [1]]
+
+  if(!length(beta_lsds)%in%c(2,4)){
+    stop("beta_lsds should be of length 2 (intercepts only)
+       or of length 4 (intercepts + slopes on group effects)") 
+  }
+  # check whether beta_lsds has the right number of fixed effects [2 or 4]]
+
+  if(any(!diag(C_lsds)>0)){
+    stop("C_lsds should be positive definite") 
+  }
+  if(abs(C_lsds[2,1]/prod(sqrt(diag(C_lsds))))>1){
+    stop("C_lsds should be positive definite") 
+  }
+
+  # check whether C_lsds is positive definite
+
+  ny<-Ng*n*c
+  
+  egroup<-rnorm(Ng, 0, sgroup)
+  # simulate group random effects for mean part of the model
+
+  beta_muvar<-matrix(0,1,2)
+  if(length(beta_lsds)==4){
+    beta_muvar[c(1,2)]<-beta_lsds[c(3,4)]
+  } 
+  # Slopes for the mean-log(sd) relationship organised into matrix form (1 x 2)
+  # When premutiplied by the group effects (Ng x 2) it gives the predicted log(sd) given the mean
+
+  mu_lsds<-t(beta_lsds[1:2]+t(egroup%*%beta_muvar))
+  # matrix (Ng x 2) of predicted log(sd)s form fixed effects
+
+  sds<-exp(mu_lsds+mvrnorm(Ng, rep(0,2), C_lsds))
+  # matrix (Ng x 2) of sds
+
+  egroup_by_subgroup = matrix(rnorm(Ng*c, 0, sds[,1]),Ng,c)
+  # simulate matrix of group by subgroup effects
+
+  mu<-beta+egroup[data$group]+t(egroup_by_subgroup)[data$group_by_subgroup]
+  # combine fixed and random effects
+
+  data$y<-rnorm(ny, mu, sds[data$group,2])
+  # simulate observations conditional on linear predictors (fixed+random) and group specific Ve.
+
+  return(data)
+}
+```
+
+
+# Simulate data for a DHGLM and fit Stan model
+
+Below, we simulate data, fit the DHGLM in Stan and plot the MCMC chains. Running multiple chains for longer would be advisable. 
+
+```{r, eval=rerun_stan, fig.height = 12, fig.width=8}
+Ng <- 1000 # number of groups
+c <- 4     # number of subgroups
+n <- 5     # number of observations within subgroups
+
+beta <-10                 # intercept of  Mean Model
+sgroup<-1                 # between-group standard-deviation
+beta_lsds<-c(-1, 0)       # intercepts, no mean-variance relationship.
+
+sigma_lsds <- c(0.8,0.9)  # standard deviations of subgroup and residual log standard-deviations
+r_lsds<-0.3               # correlation between subgroup and residual log standard-deviations
+
+C_lsds<-matrix(r_lsds*prod(sigma_lsds), 2, 2)
+diag(C_lsds)<-sigma_lsds^2 # (co)varinaces for subgroup and residual log standard-deviations
+
+sim_data<-sim_DHGLM(Ng=Ng, c=c, n=n, beta=beta, sgroup=sgroup, beta_lsds=beta_lsds,  C_lsds=C_lsds)
+# simulate data
+
+sim_stan<-list(
+            Nt=Ng*c*n,
+            Ng=Ng,
+            c=c,
+            muvar=0,
+            y=sim_data$y,    
+            group=sim_data$group,
+            subgroup=sim_data$subgroup
+          )
+# stan list
+
+model_output<-sampling(DHGLM_stan, data = sim_stan, chains = 1, refresh=-1)
+# fit model
+
+pars<-c("beta","beta_lsds[1]","beta_lsds[2]","r_lsds[1,2]","sgroup","sigma_lsds[1]","sigma_lsds[2]")
+# parameters to plot
+
+post<-mcmc(as.data.frame(model_output)[pars])
+plot(post) # plot MCMC trace and density plot
+```
+
+```{r, eval=rerun_stan, include=FALSE}
+rm(model_output)
+```
+
+# Sampling designs
+
+Given that DHGLM estimates of the (co)variance of variances cannot be obtained analytically, it seems unlikely that exact expressions for how power changes with sampling design and effort could be found. Instead, we simulate data sets of 3200 observations under the set of parameters defined above. We simulate 10 data sets for each of the 83 possible designs where `n` and `c` range between 2 and 40, analyse them using `DHGLM_stan` and store the posterior standard deviation of the correlation of the log-scale variances.
+
+
+```{r eval=!rerun_sim_power, include=FALSE}
+if(file.exists(file.path(base_path, "Data/Intermediate/Simulation/sim_power.Rdata"))){
+  load(file.path(base_path, "Data/Intermediate/Simulation/sim_power.Rdata"))
+}else{
+  stop("sim_power.Rdata doesn't exist and rerun_sim_power=FALSE")
+}  
+```
+
+```{r sim_power, eval=rerun_sim_power}
+design_obs<-expand.grid(2:40,2:40)
+# generate all combinations of n and c for values ranging from 2 to 40. 
+
+design_obs<-design_obs[which(3200%%apply(design_obs,1, prod)==0),]
+# save combinations where 3200/(nc)=Ng is integer
+
+design_obs<-cbind(3200/apply(design_obs, 1, prod), design_obs, NA, NA)
+# add Ng to design_obs and columns for storing the posterior mean and sd.
+
+colnames(design_obs)<-c("Ng", "n", "c", "post.mean", "post.sd")
+
+
+design_obs<-design_obs[rep(1:nrow(design_obs),10),]
+# duplicate design_obs 10X.
+
+for(i in 1:nrow(design_obs)){
+# iterate through designs
+
+  Ng<-design_obs[i,"Ng"]
+  c<-design_obs[i,"c"] 
+  n<-design_obs[i,"n"] 
+  N<-n*c
+
+  sim_data<-sim_DHGLM(Ng=Ng, c=c, n=n, beta=beta, sgroup=sgroup, beta_lsds=beta_lsds, C_lsds=C_lsds)
+  # simulate data
+
+  sim_stan<-list(
+            Nt=Ng*c*n,
+            Ng=Ng,
+            c=c,
+            muvar=0,
+            y=sim_data$y,    
+            group=sim_data$group,
+            subgroup=sim_data$subgroup)
+  # format data for stan
+
+  model_output<-sampling(DHGLM_stan, data = sim_stan, chains = 1, iter = 5000, refresh=-1)
+  # fit model
+
+  design_obs$post.mean[i]<-mean(model_output@sim$samples[[1]]["r_lsds[1,2]"][[1]])
+  design_obs$post.sd[i]<-sd(model_output@sim$samples[[1]]["r_lsds[1,2]"][[1]])
+  # store posterior mean and standard deviation of the log-scale correlation between variances 
+  print(i)
+}
+```
+
+```{r  eval=rerun_sim_power & save_sim, include=FALSE}
+save(design_obs, file=file.path(base_path, "Data/Intermediate/Simulation/sim_power.Rdata"))
+```
+
+We take the average posterior standard deviation (averaged over the 10 data sets for each design) and show how it varies according to the number of groups ($N_g$) and how replication within a group is partitioned within subgroup and between subgroups ($n/c$). 
+
+```{r }
+design_obs_means<-design_obs %>%  group_by(Ng, c, n) %>%
+  summarise(
+    post.sd = mean(post.sd), post.mean = mean(post.mean)
+)
+
+plot(design_obs_means$post.sd~design_obs_means$Ng, type="n", ylab="Posterior Standard Deviation", xlab="Number of Groups", bty="l")
+
+design_obs_means$cn.ratio<-design_obs_means$c/design_obs_means$n
+
+col_fac<-sort(unique(design_obs_means$cn.ratio))
+design_obs_means$col_fac<-match(design_obs_means$cn.ratio, col_fac)
+
+for(i in 1:length(col_fac)){
+  points(design_obs_means$post.sd[which(design_obs_means$col_fac==i)]~design_obs_means$Ng[which(design_obs_means$col_fac==i)], col=hcl.colors(length(col_fac), alpha=1)[i])
+
+}
+legend(50, 0.52, legend=formatC(round(col_fac[seq(1, length(col_fac), 2)],2),2, format="f"), fill=hcl.colors(length(col_fac), alpha=1)[seq(1, length(col_fac), 2)], ncol=6, title="Number of sub-groups /Observations per sub-group")
+
+```
+
+The optimal design has a modest number of observations within each group ($n=c=5$) but the number of groups is large ($N_g=128$). Although many designs have comparable precision, ensuring the number of groups is at least as large as the number of observations per group seems warranted. When deciding how observations are partitioned within a group it seems best to keep $n$ and $c$ roughly comparable, or to slightly favour $n$ over $c$. The leading designs are:
+
+```{r }
+head(design_obs_means[order(design_obs_means$post.sd),1:4])
+```
+
+The best design is likely to depend on the true underlying parameter values, and we advocate rerunning these simulations before designing the experiment if it is believed the true underlying parameter values are likely to deviate from those used.
+
+
+
