@@ -1,4 +1,10 @@
 
+
+
+[![DOI](https://zenodo.org/badge/996777979.svg)](https://doi.org/10.5281/zenodo.15602769)
+
+
+
 # Fitting a multi-way DHGLM 
 
 Jessica G. King (1,2), Joel L. Pick (1), Jarrod D. Hadfield (1)
